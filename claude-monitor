@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""CLI tool to monitor changes made by Claude Code on this server."""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+FILE_HISTORY_DIR = CLAUDE_DIR / "file-history"
+
+COLORS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+}
+
+
+def c(text, color):
+    """Colorize text."""
+    if not sys.stdout.isatty():
+        return str(text)
+    return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+
+
+def ts_to_str(ts_ms):
+    """Convert millisecond timestamp to readable string."""
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def relative_time(ts_ms):
+    """Convert timestamp to relative time string."""
+    now = datetime.now().timestamp() * 1000
+    diff_s = (now - ts_ms) / 1000
+    if diff_s < 60:
+        return f"{int(diff_s)}s ago"
+    elif diff_s < 3600:
+        return f"{int(diff_s / 60)}m ago"
+    elif diff_s < 86400:
+        return f"{int(diff_s / 3600)}h ago"
+    else:
+        return f"{int(diff_s / 86400)}d ago"
+
+
+def get_sessions():
+    """Get all session info from session files."""
+    sessions = {}
+    if not SESSIONS_DIR.exists():
+        return sessions
+    for f in SESSIONS_DIR.iterdir():
+        if f.suffix == ".json":
+            try:
+                data = json.loads(f.read_text())
+                sid = data.get("sessionId", "")
+                sessions[sid] = data
+            except (json.JSONDecodeError, OSError):
+                pass
+    return sessions
+
+
+def get_active_sessions():
+    """Get currently active Claude Code sessions."""
+    sessions = get_sessions()
+    active = []
+    for sid, info in sessions.items():
+        pid = info.get("pid")
+        if pid and os.path.exists(f"/proc/{pid}"):
+            active.append(info)
+    return active
+
+
+def get_history():
+    """Parse the history.jsonl file."""
+    entries = []
+    if not HISTORY_FILE.exists():
+        return entries
+    for line in HISTORY_FILE.read_text().strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return entries
+
+
+def get_file_changes(session_id=None):
+    """Get file change records from file-history."""
+    changes = []
+    if not FILE_HISTORY_DIR.exists():
+        return changes
+
+    dirs = [FILE_HISTORY_DIR / session_id] if session_id else FILE_HISTORY_DIR.iterdir()
+
+    for session_dir in dirs:
+        if not session_dir.is_dir():
+            continue
+        sid = session_dir.name
+        for fpath in session_dir.iterdir():
+            name = fpath.name
+            # Extract version from filename like "hash@v2"
+            version = "v1"
+            if "@" in name:
+                parts = name.rsplit("@", 1)
+                version = parts[1]
+            stat = fpath.stat()
+            changes.append({
+                "session_id": sid,
+                "file": name,
+                "version": version,
+                "modified": stat.st_mtime,
+                "size": stat.st_size,
+            })
+    changes.sort(key=lambda x: x["modified"], reverse=True)
+    return changes
+
+
+def get_git_changes(repo_path, author_pattern="Claude"):
+    """Get git commits by Claude from a repo."""
+    commits = []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "log",
+             f"--author={author_pattern}",
+             "--format=%H|%ai|%s", "--all"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+                parts = line.split("|", 2)
+                if len(parts) == 3:
+                    commits.append({
+                        "hash": parts[0][:8],
+                        "date": parts[1],
+                        "message": parts[2],
+                        "repo": str(repo_path),
+                    })
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return commits
+
+
+def get_git_diff_stats(repo_path, commit_hash):
+    """Get diff stats for a commit."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "diff", "--stat", f"{commit_hash}~1", commit_hash],
+            capture_output=True, text=True, timeout=10
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def find_git_repos(base_path=None):
+    """Find git repositories under the base path."""
+    base = Path(base_path) if base_path else Path.home()
+    repos = []
+    for item in base.iterdir():
+        if item.is_dir() and (item / ".git").exists():
+            repos.append(item)
+    return repos
+
+
+def cmd_status(args):
+    """Show current Claude Code status."""
+    print(c("═══ Claude Code Monitor ═══", "bold"))
+    print()
+
+    # Active sessions
+    active = get_active_sessions()
+    if active:
+        print(c(f"● {len(active)} active session(s)", "green"))
+        for s in active:
+            started = ts_to_str(s.get("startedAt", 0))
+            rel = relative_time(s.get("startedAt", 0))
+            print(f"  PID {c(s.get('pid', '?'), 'cyan')} | "
+                  f"Dir: {c(s.get('cwd', '?'), 'yellow')} | "
+                  f"Started: {started} ({rel})")
+            print(f"  Session: {c(s.get('sessionId', '?')[:16] + '...', 'dim')}")
+    else:
+        print(c("○ No active sessions", "dim"))
+    print()
+
+    # Recent history
+    history = get_history()
+    if history:
+        print(c(f"Recent prompts ({len(history)} total):", "bold"))
+        for entry in history[-5:]:
+            ts = ts_to_str(entry.get("timestamp", 0))
+            rel = relative_time(entry.get("timestamp", 0))
+            display = entry.get("display", "")
+            # Truncate long prompts, hide secrets
+            if len(display) > 80:
+                display = display[:77] + "..."
+            if "eyJ" in display or "token" in display.lower():
+                display = c("[redacted - contains token]", "red")
+            print(f"  {c(ts, 'dim')} ({rel})  {display}")
+    print()
+
+    # File changes
+    changes = get_file_changes()
+    if changes:
+        print(c(f"File history: {len(changes)} file version(s) tracked", "bold"))
+        for ch in changes[:5]:
+            ts = datetime.fromtimestamp(ch["modified"]).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"  {c(ts, 'dim')}  {ch['file']} ({ch['version']}, {ch['size']}B)")
+    print()
+
+
+def cmd_sessions(args):
+    """List all sessions."""
+    sessions = get_sessions()
+    history = get_history()
+
+    # Group history by session
+    session_prompts = {}
+    for entry in history:
+        sid = entry.get("sessionId", "")
+        session_prompts.setdefault(sid, []).append(entry)
+
+    print(c(f"Sessions ({len(sessions)} total):", "bold"))
+    print()
+
+    for sid, info in sorted(sessions.items(), key=lambda x: x[1].get("startedAt", 0), reverse=True):
+        pid = info.get("pid")
+        is_active = pid and os.path.exists(f"/proc/{pid}")
+        status = c("● ACTIVE", "green") if is_active else c("○ ended", "dim")
+
+        started = ts_to_str(info.get("startedAt", 0))
+        rel = relative_time(info.get("startedAt", 0))
+
+        print(f"  {status}  {c(sid[:16], 'cyan')}...")
+        print(f"    PID: {pid} | Dir: {info.get('cwd', '?')} | Started: {started} ({rel})")
+
+        prompts = session_prompts.get(sid, [])
+        if prompts:
+            print(f"    Prompts ({len(prompts)}):")
+            for p in prompts[:3]:
+                display = p.get("display", "")
+                if len(display) > 70:
+                    display = display[:67] + "..."
+                if "eyJ" in display or "token" in display.lower():
+                    display = c("[redacted]", "red")
+                print(f"      → {display}")
+            if len(prompts) > 3:
+                print(f"      ... and {len(prompts) - 3} more")
+
+        # File changes for this session
+        fchanges = get_file_changes(sid)
+        if fchanges:
+            print(f"    Files modified: {len(fchanges)}")
+        print()
+
+
+def cmd_commits(args):
+    """Show git commits made by Claude."""
+    repos = find_git_repos(args.path)
+    if not repos:
+        print(c("No git repositories found.", "yellow"))
+        return
+
+    all_commits = []
+    for repo in repos:
+        commits = get_git_changes(repo, args.author)
+        all_commits.extend(commits)
+
+    if not all_commits:
+        print(c(f"No commits found matching author '{args.author}'.", "yellow"))
+        # Show all recent commits instead
+        print(c("\nAll recent commits:", "bold"))
+        for repo in repos:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), "log", "--format=%H|%ai|%an|%s", "-10"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    print(c(f"\n  {repo.name}/", "cyan"))
+                    for line in result.stdout.strip().split("\n"):
+                        parts = line.split("|", 3)
+                        if len(parts) == 4:
+                            print(f"    {c(parts[0][:8], 'yellow')} {parts[1][:10]} "
+                                  f"{c(parts[2], 'magenta')} {parts[3]}")
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        return
+
+    print(c(f"Claude commits ({len(all_commits)}):", "bold"))
+    print()
+    for commit in all_commits:
+        print(f"  {c(commit['hash'], 'yellow')} {commit['date'][:10]}  "
+              f"{c(commit['message'], 'white')}")
+        print(f"    Repo: {c(Path(commit['repo']).name, 'cyan')}")
+
+        if args.verbose:
+            stats = get_git_diff_stats(commit["repo"], commit["hash"])
+            if stats:
+                for sline in stats.split("\n"):
+                    print(f"      {sline}")
+        print()
+
+
+def cmd_diff(args):
+    """Show recent changes in git repos."""
+    repos = find_git_repos(args.path)
+    if not repos:
+        print(c("No git repositories found.", "yellow"))
+        return
+
+    for repo in repos:
+        print(c(f"═══ {repo.name}/ ═══", "bold"))
+
+        # Uncommitted changes
+        result = subprocess.run(
+            ["git", "-C", str(repo), "status", "--short"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.stdout.strip():
+            print(c("\nUncommitted changes:", "yellow"))
+            for line in result.stdout.strip().split("\n"):
+                status = line[:2].strip()
+                fname = line[3:]
+                color = "green" if status in ("A", "??") else "yellow" if status == "M" else "red"
+                print(f"  {c(status, color)} {fname}")
+
+        # Recent commits
+        result = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%H|%ai|%an|%s",
+             f"-{args.count}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.stdout.strip():
+            print(c(f"\nLast {args.count} commits:", "bold"))
+            for line in result.stdout.strip().split("\n"):
+                parts = line.split("|", 3)
+                if len(parts) == 4:
+                    is_claude = "claude" in parts[2].lower()
+                    marker = c("🤖", "cyan") if is_claude else "  "
+                    author_color = "cyan" if is_claude else "dim"
+                    print(f"  {marker} {c(parts[0][:8], 'yellow')} "
+                          f"{c(parts[2], author_color)} {parts[3]}")
+
+                    if args.verbose:
+                        stats = get_git_diff_stats(repo, parts[0])
+                        if stats:
+                            for sline in stats.split("\n"):
+                                print(f"      {sline}")
+        print()
+
+
+def cmd_watch(args):
+    """Watch for changes in real-time."""
+    import time
+
+    print(c("Watching for Claude Code changes... (Ctrl+C to stop)", "bold"))
+    print()
+
+    last_history_len = len(get_history())
+    last_file_count = len(get_file_changes())
+    known_sessions = set(s.get("sessionId") for s in get_active_sessions())
+
+    try:
+        while True:
+            # Check for new prompts
+            history = get_history()
+            if len(history) > last_history_len:
+                for entry in history[last_history_len:]:
+                    ts = ts_to_str(entry.get("timestamp", 0))
+                    display = entry.get("display", "")
+                    if "eyJ" in display or "token" in display.lower():
+                        display = c("[redacted]", "red")
+                    elif len(display) > 80:
+                        display = display[:77] + "..."
+                    print(f"  {c('PROMPT', 'magenta')} {ts}  {display}")
+                last_history_len = len(history)
+
+            # Check for new file changes
+            files = get_file_changes()
+            if len(files) > last_file_count:
+                diff = len(files) - last_file_count
+                print(f"  {c('FILES', 'yellow')}  {diff} new file version(s) recorded")
+                last_file_count = len(files)
+
+            # Check for new/ended sessions
+            current_sessions = set(s.get("sessionId") for s in get_active_sessions())
+            new_sessions = current_sessions - known_sessions
+            ended_sessions = known_sessions - current_sessions
+            for sid in new_sessions:
+                print(f"  {c('START', 'green')}  New session: {sid[:16]}...")
+            for sid in ended_sessions:
+                print(f"  {c('END', 'red')}    Session ended: {sid[:16]}...")
+            known_sessions = current_sessions
+
+            # Check git repos for new commits
+            repos = find_git_repos(args.path)
+            for repo in repos:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), "log", "--format=%H|%ai|%an|%s", "-1"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.stdout.strip():
+                    pass  # Could track last known commit per repo
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(c("\nStopped.", "dim"))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="claude-monitor",
+        description="Monitor changes made by Claude Code on this server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  claude-monitor status          Show current status overview
+  claude-monitor sessions        List all Claude Code sessions
+  claude-monitor commits         Show git commits by Claude
+  claude-monitor diff            Show recent repo changes
+  claude-monitor diff -v         Show changes with file-level stats
+  claude-monitor watch           Watch for changes in real-time
+  claude-monitor watch -i 5      Watch with 5-second interval
+        """,
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    # status
+    sub.add_parser("status", aliases=["s"], help="Show current status overview")
+
+    # sessions
+    sub.add_parser("sessions", aliases=["ss"], help="List all sessions")
+
+    # commits
+    p_commits = sub.add_parser("commits", aliases=["c"], help="Show git commits")
+    p_commits.add_argument("-a", "--author", default="Claude",
+                           help="Author pattern to match (default: Claude)")
+    p_commits.add_argument("-p", "--path", default=str(Path.home()),
+                           help="Base path to search for repos")
+    p_commits.add_argument("-v", "--verbose", action="store_true",
+                           help="Show file-level diff stats")
+
+    # diff
+    p_diff = sub.add_parser("diff", aliases=["d"], help="Show recent changes")
+    p_diff.add_argument("-p", "--path", default=str(Path.home()),
+                        help="Base path to search for repos")
+    p_diff.add_argument("-n", "--count", type=int, default=10,
+                        help="Number of recent commits to show")
+    p_diff.add_argument("-v", "--verbose", action="store_true",
+                        help="Show file-level diff stats")
+
+    # watch
+    p_watch = sub.add_parser("watch", aliases=["w"], help="Watch for changes in real-time")
+    p_watch.add_argument("-i", "--interval", type=int, default=3,
+                         help="Poll interval in seconds (default: 3)")
+    p_watch.add_argument("-p", "--path", default=str(Path.home()),
+                         help="Base path to search for repos")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        cmd_status(args)
+        return
+
+    commands = {
+        "status": cmd_status, "s": cmd_status,
+        "sessions": cmd_sessions, "ss": cmd_sessions,
+        "commits": cmd_commits, "c": cmd_commits,
+        "diff": cmd_diff, "d": cmd_diff,
+        "watch": cmd_watch, "w": cmd_watch,
+    }
+
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
