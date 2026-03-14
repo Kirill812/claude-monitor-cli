@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-monitor"
+version = "0.1.0"
+description = "CLI tool to monitor changes made by Claude Code on a server"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Kirill812"}]
+
+[project.scripts]
+claude-monitor = "claude_monitor.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Kirill812/claude-monitor-cli"
