@@ -4,79 +4,57 @@ import argparse
 from pathlib import Path
 
 from . import __version__
-from .commands import cmd_commits, cmd_diff, cmd_sessions, cmd_status, cmd_watch
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="claude-monitor",
-        description="Monitor changes made by Claude Code on this server",
+        description="Live monitoring dashboard for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  claude-monitor                  Status overview (default)
-  claude-monitor sessions         List all sessions
-  claude-monitor commits          Git commits by Claude
-  claude-monitor diff             Recent repo changes
-  claude-monitor diff -v          With file-level stats
-  claude-monitor watch            Real-time monitoring
-  claude-monitor watch -i 5       Poll every 5 seconds
+  claude-monitor                  Launch live dashboard (default)
+  claude-monitor --static         One-shot status output
+  claude-monitor --static diff    Show recent repo changes
 """,
     )
     parser.add_argument(
         "-V", "--version", action="version", version=f"%(prog)s {__version__}"
     )
+    parser.add_argument(
+        "--static", action="store_true",
+        help="One-shot text output instead of live dashboard",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
-    # status
     sub.add_parser("status", aliases=["s"], help="Status overview")
-
-    # sessions
     sub.add_parser("sessions", aliases=["ss"], help="List all sessions")
 
-    # commits
     p_commits = sub.add_parser("commits", aliases=["c"], help="Git commits by Claude")
-    p_commits.add_argument(
-        "-a", "--author", default="Claude", help="Author pattern (default: Claude)"
-    )
-    p_commits.add_argument(
-        "-p", "--path", default=str(Path.home()), help="Base path to scan for repos"
-    )
-    p_commits.add_argument(
-        "-v", "--verbose", action="store_true", help="Show file-level diff stats"
-    )
+    p_commits.add_argument("-a", "--author", default="Claude")
+    p_commits.add_argument("-p", "--path", default=str(Path.home()))
+    p_commits.add_argument("-v", "--verbose", action="store_true")
 
-    # diff
     p_diff = sub.add_parser("diff", aliases=["d"], help="Recent repo changes")
-    p_diff.add_argument(
-        "-p", "--path", default=str(Path.home()), help="Base path to scan for repos"
-    )
-    p_diff.add_argument(
-        "-n", "--count", type=int, default=10, help="Number of commits (default: 10)"
-    )
-    p_diff.add_argument(
-        "-v", "--verbose", action="store_true", help="Show file-level diff stats"
-    )
-
-    # watch
-    p_watch = sub.add_parser("watch", aliases=["w"], help="Real-time monitoring")
-    p_watch.add_argument(
-        "-i", "--interval", type=int, default=3, help="Poll interval in seconds (default: 3)"
-    )
-    p_watch.add_argument(
-        "-p", "--path", default=str(Path.home()), help="Base path to scan for repos"
-    )
+    p_diff.add_argument("-p", "--path", default=str(Path.home()))
+    p_diff.add_argument("-n", "--count", type=int, default=10)
+    p_diff.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
 
-    commands = {
-        "status": cmd_status, "s": cmd_status,
-        "sessions": cmd_sessions, "ss": cmd_sessions,
-        "commits": cmd_commits, "c": cmd_commits,
-        "diff": cmd_diff, "d": cmd_diff,
-        "watch": cmd_watch, "w": cmd_watch,
-        None: cmd_status,
-    }
-
-    commands[args.command](args)
+    # If --static or a subcommand is given, use the old text commands
+    if args.static or args.command:
+        from .commands import cmd_commits, cmd_diff, cmd_sessions, cmd_status
+        commands = {
+            "status": cmd_status, "s": cmd_status,
+            "sessions": cmd_sessions, "ss": cmd_sessions,
+            "commits": cmd_commits, "c": cmd_commits,
+            "diff": cmd_diff, "d": cmd_diff,
+            None: cmd_status,
+        }
+        commands[args.command](args)
+    else:
+        # Launch live TUI dashboard
+        from .app import run
+        run()

@@ -1,9 +1,13 @@
 """Data access layer for Claude Code artifacts."""
 
+import asyncio
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
+
+import psutil
 
 from .config import FILE_HISTORY_DIR, HISTORY_FILE, SESSIONS_DIR
 
@@ -25,14 +29,58 @@ def get_sessions():
 
 
 def get_active_sessions():
-    """Get sessions whose PID is still running."""
+    """Get sessions whose PID is still running, enriched with process info."""
     sessions = get_sessions()
     active = []
     for sid, info in sessions.items():
         pid = info.get("pid")
         if pid and os.path.exists(f"/proc/{pid}"):
+            # Enrich with process stats
+            try:
+                proc = psutil.Process(pid)
+                info["cpu_percent"] = proc.cpu_percent(interval=0)
+                mem = proc.memory_info()
+                info["mem_mb"] = mem.rss / (1024 * 1024)
+                info["status"] = proc.status()
+                # Count child processes (subagents, tools)
+                children = proc.children(recursive=True)
+                info["children"] = len(children)
+                info["total_mem_mb"] = info["mem_mb"] + sum(
+                    c.memory_info().rss / (1024 * 1024) for c in children
+                    if c.is_running()
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                info["cpu_percent"] = 0
+                info["mem_mb"] = 0
+                info["status"] = "unknown"
+                info["children"] = 0
+                info["total_mem_mb"] = 0
             active.append(info)
     return active
+
+
+def get_all_sessions_with_status():
+    """Get all sessions marked as active or ended."""
+    sessions = get_sessions()
+    result = []
+    for sid, info in sessions.items():
+        pid = info.get("pid")
+        info["is_active"] = bool(pid and os.path.exists(f"/proc/{pid}"))
+        if info["is_active"]:
+            try:
+                proc = psutil.Process(pid)
+                info["cpu_percent"] = proc.cpu_percent(interval=0)
+                mem = proc.memory_info()
+                info["mem_mb"] = mem.rss / (1024 * 1024)
+                children = proc.children(recursive=True)
+                info["children"] = len(children)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                info["cpu_percent"] = 0
+                info["mem_mb"] = 0
+                info["children"] = 0
+        result.append(info)
+    result.sort(key=lambda x: (not x["is_active"], -x.get("startedAt", 0)))
+    return result
 
 
 def get_history():
@@ -40,7 +88,11 @@ def get_history():
     entries = []
     if not HISTORY_FILE.exists():
         return entries
-    for line in HISTORY_FILE.read_text().strip().split("\n"):
+    try:
+        text = HISTORY_FILE.read_text().strip()
+    except OSError:
+        return entries
+    for line in text.split("\n"):
         if not line.strip():
             continue
         try:
@@ -70,16 +122,19 @@ def get_file_changes(session_id=None):
             if "@" in name:
                 parts = name.rsplit("@", 1)
                 version = parts[1]
-            stat = fpath.stat()
-            changes.append(
-                {
-                    "session_id": sid,
-                    "file": name,
-                    "version": version,
-                    "modified": stat.st_mtime,
-                    "size": stat.st_size,
-                }
-            )
+            try:
+                stat = fpath.stat()
+                changes.append(
+                    {
+                        "session_id": sid,
+                        "file": name,
+                        "version": version,
+                        "modified": stat.st_mtime,
+                        "size": stat.st_size,
+                    }
+                )
+            except OSError:
+                pass
     changes.sort(key=lambda x: x["modified"], reverse=True)
     return changes
 
@@ -95,6 +150,22 @@ def find_git_repos(base_path=None):
     except PermissionError:
         pass
     return repos
+
+
+async def async_git_command(*args, timeout=10):
+    """Run a git command asynchronously."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if proc.returncode == 0:
+            return stdout.decode().strip()
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        pass
+    return ""
 
 
 def get_git_commits(repo_path, author_pattern="Claude"):
@@ -192,3 +263,52 @@ def get_git_status(repo_path):
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     return []
+
+
+def get_system_stats():
+    """Get system resource usage."""
+    cpu = psutil.cpu_percent(interval=0)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    return {
+        "cpu_percent": cpu,
+        "mem_total_gb": mem.total / (1024 ** 3),
+        "mem_used_gb": mem.used / (1024 ** 3),
+        "mem_percent": mem.percent,
+        "disk_total_gb": disk.total / (1024 ** 3),
+        "disk_used_gb": disk.used / (1024 ** 3),
+        "disk_percent": disk.percent,
+    }
+
+
+def sanitize_display(text, max_len=80):
+    """Truncate and redact sensitive content from display text."""
+    if "eyJ" in text or "token" in text.lower():
+        return "[redacted]"
+    if len(text) > max_len:
+        return text[: max_len - 3] + "..."
+    return text
+
+
+def relative_time(ts_ms):
+    """Convert millisecond timestamp to relative time string."""
+    now = datetime.now().timestamp() * 1000
+    diff_s = (now - ts_ms) / 1000
+    if diff_s < 0:
+        return "just now"
+    if diff_s < 60:
+        return f"{int(diff_s)}s ago"
+    elif diff_s < 3600:
+        return f"{int(diff_s / 60)}m ago"
+    elif diff_s < 86400:
+        h = int(diff_s / 3600)
+        m = int((diff_s % 3600) / 60)
+        return f"{h}h{m}m ago"
+    else:
+        return f"{int(diff_s / 86400)}d ago"
+
+
+def ts_to_str(ts_ms):
+    """Convert millisecond timestamp to readable string."""
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%H:%M:%S")
