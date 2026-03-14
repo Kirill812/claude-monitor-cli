@@ -1,18 +1,16 @@
 """Claude Code Monitor - Live TUI Dashboard."""
 
-import platform
 import socket
 from datetime import datetime
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import (
     DataTable,
     Footer,
-    Header,
     RichLog,
     Static,
 )
@@ -47,7 +45,6 @@ class StatusBar(Static):
         mem_used = sys_stats.get("mem_used_gb", 0)
         mem_total = sys_stats.get("mem_total_gb", 0)
 
-        # Color CPU based on load
         if cpu > 80:
             cpu_style = "bold red"
         elif cpu > 50:
@@ -55,7 +52,6 @@ class StatusBar(Static):
         else:
             cpu_style = "green"
 
-        # Color memory
         if mem_pct > 85:
             mem_style = "bold red"
         elif mem_pct > 60:
@@ -84,7 +80,7 @@ class StatusBar(Static):
 
 
 class SessionPanel(Static):
-    """Panel showing active Claude Code sessions."""
+    """Panel showing active Claude Code sessions. Height adapts to content."""
 
     def compose(self) -> ComposeResult:
         yield Static("[bold]Sessions[/bold]", classes="panel-title")
@@ -112,7 +108,6 @@ class SessionPanel(Static):
 
             pid = str(s.get("pid", "?"))
             cwd = s.get("cwd", "?")
-            # Shorten home dir
             cwd = cwd.replace(str(Path.home()), "~")
             if len(cwd) > 25:
                 cwd = "..." + cwd[-22:]
@@ -123,6 +118,12 @@ class SessionPanel(Static):
             cpu = f"{s.get('cpu_percent', 0):.0f}%" if is_active else "-"
 
             table.add_row(status, pid, cwd, started, children, mem, cpu)
+
+        # Adapt height: title(1) + header(1) + border(2) + rows + min 1
+        row_count = max(len(sessions), 1)
+        # Clamp between 5 and 12
+        new_height = min(max(row_count + 4, 5), 12)
+        self.styles.height = new_height
 
 
 class ActivityFeed(Static):
@@ -143,11 +144,10 @@ class ActivityFeed(Static):
         log = self.query_one("#activity-log", RichLog)
         log.write(Text("Monitoring started...", style="dim italic"))
 
-        # Show recent history on startup
         history = get_history()
-        for entry in history[-5:]:
+        for entry in history[-8:]:
             ts = ts_to_str(entry.get("timestamp", 0))
-            display = sanitize_display(entry.get("display", ""), max_len=60)
+            display = sanitize_display(entry.get("display", ""), max_len=70)
             sid = entry.get("sessionId", "?")[:8]
             line = Text()
             line.append(f" {ts} ", style="dim")
@@ -160,12 +160,11 @@ class ActivityFeed(Static):
         log = self.query_one("#activity-log", RichLog)
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        # New prompts
         history = get_history()
         if len(history) > self._last_history_len:
             for entry in history[self._last_history_len:]:
                 ts = ts_to_str(entry.get("timestamp", 0))
-                display = sanitize_display(entry.get("display", ""), max_len=60)
+                display = sanitize_display(entry.get("display", ""), max_len=70)
                 sid = entry.get("sessionId", "?")[:8]
                 line = Text()
                 line.append(f" {ts} ", style="dim")
@@ -175,11 +174,9 @@ class ActivityFeed(Static):
                 log.write(line)
             self._last_history_len = len(history)
 
-        # New file changes
         files = get_file_changes()
         if len(files) > self._last_file_count:
             new_count = len(files) - self._last_file_count
-            # Show the newest changes
             for ch in files[:new_count]:
                 event_key = f"{ch['file']}@{ch['version']}"
                 if event_key not in self._seen_events:
@@ -209,7 +206,6 @@ class GitPanel(Static):
         for repo in repos:
             repo_name = repo.name
 
-            # Uncommitted changes
             status = get_git_status(repo)
             if status:
                 header = Text()
@@ -242,7 +238,6 @@ class GitPanel(Static):
                 header.append("  clean", style="dim green")
                 log.write(header)
 
-            # Recent commits
             entries = get_git_log(repo, count=5)
             for e in entries:
                 is_claude = "claude" in e["author"].lower()
@@ -257,12 +252,12 @@ class GitPanel(Static):
                     style="cyan" if is_claude else "dim",
                 )
                 msg = e["message"]
-                if len(msg) > 40:
-                    msg = msg[:37] + "..."
+                if len(msg) > 50:
+                    msg = msg[:47] + "..."
                 line.append(msg)
                 log.write(line)
 
-            log.write(Text(""))  # spacer
+            log.write(Text(""))
 
 
 class PromptHistory(Static):
@@ -277,7 +272,6 @@ class PromptHistory(Static):
         log.clear()
 
         history = get_history()
-        # Group by session
         by_session = {}
         for entry in history:
             sid = entry.get("sessionId", "unknown")
@@ -296,7 +290,7 @@ class PromptHistory(Static):
             for p in prompts[-8:]:
                 ts = ts_to_str(p.get("timestamp", 0))
                 rel = relative_time(p.get("timestamp", 0))
-                display = sanitize_display(p.get("display", ""), max_len=55)
+                display = sanitize_display(p.get("display", ""), max_len=65)
                 line = Text()
                 line.append(f"   {ts} ", style="dim")
                 line.append(f"({rel}) ", style="dim")
@@ -308,94 +302,39 @@ class PromptHistory(Static):
 
 CSS = """\
 Screen {
-    layout: grid;
-    grid-size: 2 3;
-    grid-rows: 3 1fr 1fr;
-    grid-gutter: 0;
+    layout: vertical;
 }
 
 StatusBar {
-    column-span: 2;
     height: 3;
     background: $surface;
     padding: 1 0 0 0;
 }
 
 SessionPanel {
-    column-span: 2;
+    height: auto;
+    min-height: 5;
+    max-height: 12;
     border: solid $primary;
-    height: 100%;
+}
+
+#bottom-panels {
+    height: 1fr;
 }
 
 ActivityFeed {
+    height: 1fr;
     border: solid $secondary;
-    height: 100%;
 }
 
 GitPanel {
+    height: 1fr;
     border: solid $accent;
-    height: 100%;
-}
-
-.panel-title {
-    dock: top;
-    padding: 0 1;
-    background: $boost;
-    height: 1;
-}
-
-#session-table {
-    height: 100%;
-}
-
-#activity-log, #git-log, #prompt-log {
-    height: 100%;
-    scrollbar-size: 1 1;
-}
-
-DataTable {
-    height: 100%;
-}
-
-DataTable > .datatable--cursor {
-    background: $accent 30%;
-}
-"""
-
-CSS_WIDE = """\
-Screen {
-    layout: grid;
-    grid-size: 2 3;
-    grid-rows: 3 2fr 1fr;
-    grid-gutter: 0;
-}
-
-StatusBar {
-    column-span: 2;
-    height: 3;
-    background: $surface;
-    padding: 1 0 0 0;
-}
-
-SessionPanel {
-    column-span: 2;
-    border: solid $primary;
-    height: 100%;
-}
-
-ActivityFeed {
-    border: solid $secondary;
-    height: 100%;
-}
-
-GitPanel {
-    border: solid $accent;
-    height: 100%;
 }
 
 PromptHistory {
+    height: 1fr;
     border: solid $warning;
-    height: 100%;
 }
 
 .panel-title {
@@ -406,16 +345,13 @@ PromptHistory {
 }
 
 #session-table {
-    height: 100%;
+    height: auto;
+    max-height: 10;
 }
 
 #activity-log, #git-log, #prompt-log {
-    height: 100%;
+    height: 1fr;
     scrollbar-size: 1 1;
-}
-
-DataTable {
-    height: 100%;
 }
 
 DataTable > .datatable--cursor {
@@ -441,20 +377,21 @@ class ClaudeMonitorApp(App):
     def compose(self) -> ComposeResult:
         yield StatusBar()
         yield SessionPanel()
-        yield ActivityFeed()
-        yield GitPanel()
+        yield Vertical(
+            ActivityFeed(),
+            GitPanel(),
+            id="bottom-panels",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         self.refresh_data()
-        # Tiered refresh intervals
         self.set_interval(2.0, self.refresh_sessions)
         self.set_interval(1.5, self.refresh_activity)
         self.set_interval(5.0, self.refresh_git)
         self.set_interval(2.0, self.refresh_status)
 
     def refresh_data(self) -> None:
-        """Full refresh of all panels."""
         self.refresh_sessions()
         self.refresh_activity()
         self.refresh_git()
@@ -468,7 +405,10 @@ class ClaudeMonitorApp(App):
         self.query_one(ActivityFeed).refresh_feed()
 
     def refresh_git(self) -> None:
-        self.query_one(GitPanel).update_git()
+        try:
+            self.query_one(GitPanel).update_git()
+        except Exception:
+            pass
 
     def refresh_status(self) -> None:
         active = get_active_sessions()
@@ -485,23 +425,24 @@ class ClaudeMonitorApp(App):
             self.notify("Prompt view: use 'p' to toggle back", timeout=2)
 
     def watch_show_prompts(self, show: bool) -> None:
-        """Swap between git panel and prompt history panel."""
-        git = self.query_one(GitPanel)
+        container = self.query_one("#bottom-panels", Vertical)
         if show:
-            # Replace git with prompts
+            try:
+                git = self.query_one(GitPanel)
+                git.remove()
+            except Exception:
+                pass
             prompt_panel = PromptHistory()
-            git.remove()
-            self.mount(prompt_panel, before=self.query_one(Footer))
+            container.mount(prompt_panel)
             prompt_panel.update_prompts()
         else:
-            # Replace prompts with git
             try:
                 prompts = self.query_one(PromptHistory)
                 prompts.remove()
             except Exception:
                 pass
             git_panel = GitPanel()
-            self.mount(git_panel, before=self.query_one(Footer))
+            container.mount(git_panel)
             git_panel.update_git()
 
 
